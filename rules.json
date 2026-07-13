@@ -59,5 +59,45 @@
     "window": 60,
     "ban_duration": 7776000,
     "description": "Honeypot Trap: IoT & Botnet Exploits (ADB, Mirai, TR-069, UPnP, Winbox)"
+  },
+  {
+    "type": "honeypot_port",
+    "ports": [2375, 2376, 6443, 10250, 9000],
+    "threshold": 1,
+    "window": 60,
+    "ban_duration": 7776000,
+    "description": "Honeypot Trap: Cloud & DevOps API (Docker, Kubernetes, Portainer)"
+  },
+  {
+    "type": "honeypot_port",
+    "ports": [9200, 9300, 11211, 5984, 8086],
+    "threshold": 1,
+    "window": 60,
+    "ban_duration": 7776000,
+    "description": "Honeypot Trap: Unprotected Database/Cache (Elasticsearch, Memcached, Influx)"
+  },
+  {
+    "type": "honeypot_port",
+    "ports": [5060, 5061, 3128, 1080, 2323, 6789, 37215],
+    "threshold": 1,
+    "window": 60,
+    "ban_duration": 7776000,
+    "description": "Honeypot Trap: VoIP SIP, Open Proxies & Mirai/Aisuru Alt-Telnet"
+  },
+  {
+    "type": "port_rate",
+    "ports": [25, 465, 587, 110, 143, 993, 995],
+    "threshold": 15,
+    "window": 60,
+    "ban_duration": 86400,
+    "description": "Mail Server Brute Force / Open Relay Probe (>15 attempts in 60s)"
+  },
+  {
+    "type": "port_rate",
+    "ports": [500, 4500, 1194],
+    "threshold": 20,
+    "window": 30,
+    "ban_duration": 86400,
+    "description": "VPN / Edge Gateway Aggressive Scanning (>20 attempts in 30s)"
   }
 ]
