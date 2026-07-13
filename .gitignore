@@ -1,0 +1,6 @@
+*.db
+*.db-wal
+*.db-shm
+*.sock
+__pycache__/
+.idea/
