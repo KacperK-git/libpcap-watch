@@ -186,10 +186,10 @@ def cmd_list(conn):
             pass
 
     growth_rate = bans_per_hour_24h - unbans_per_hour_24h
-    if growth_rate >= 1.0: trend_str = "▲▲▲"
-    elif growth_rate >= 0.25: trend_str = "▴▴▴"
-    elif growth_rate <= -1.0: trend_str = "▽▽▽"
-    elif growth_rate <= -0.25: trend_str = "▾▾▾"
+    if growth_rate >= 20.0: trend_str = "▲▲▲"
+    elif growth_rate >= 10.0: trend_str = "▴▴▴"
+    elif growth_rate <= -10.0: trend_str = "▽▽▽"
+    elif growth_rate <= -20.00: trend_str = "▾▾▾"
     else: trend_str = "---"
 
     print("-" * line_width)
