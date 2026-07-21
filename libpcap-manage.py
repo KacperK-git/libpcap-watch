@@ -49,11 +49,13 @@ def format_duration(seconds):
 
 
 def get_ban_set_ips(family):
-    """Return set of IP addresses currently in the given pcap nftables ban set."""
+    """Return set of IP addresses currently in the unified inet pcap_watch sets."""
+    # Map 'ip' -> 'pcap_banned_v4', 'ip6' -> 'pcap_banned_v6'
     set_name = "pcap_banned_v4" if family == "ip" else "pcap_banned_v6"
     try:
+        # Target the unified 'inet' family and 'pcap_watch' table
         output = subprocess.run(
-            ["nft", "list", "set", family, "filter", set_name],
+            ["nft", "list", "set", "inet", "pcap_watch", set_name],
             capture_output=True, text=True, check=True
         ).stdout
     except subprocess.CalledProcessError:
@@ -79,7 +81,7 @@ def get_ban_set_counters(family):
     set_name = "pcap_banned_v4" if family == "ip" else "pcap_banned_v6"
     try:
         output = subprocess.run(
-            ["nft", "list", "set", family, "filter", set_name],
+            ["nft", "list", "set", "inet", "pcap_watch", set_name],
             capture_output=True, text=True, check=True
         ).stdout
     except subprocess.CalledProcessError:
@@ -103,12 +105,12 @@ def get_ban_set_counters(family):
 
 
 def unban_ip(ip: str):
-    """Remove the IP from the pcap nftables ban set."""
-    family = "ip6" if ":" in ip else "ip"
-    set_name = "pcap_banned_v6" if family == "ip6" else "pcap_banned_v4"
+    """Remove the IP from the unified inet pcap_watch ban set."""
+    family_type = "ip6" if ":" in ip else "ip"
+    set_name = "pcap_banned_v6" if family_type == "ip6" else "pcap_banned_v4"
     try:
         subprocess.run(
-            ["nft", "delete", "element", family, "filter", set_name, f"{{ {ip} }}"],
+            ["nft", "delete", "element", "inet", "pcap_watch", set_name, f"{{ {ip} }}"],
             check=True, capture_output=True, text=True
         )
         return True
@@ -209,7 +211,12 @@ def cmd_list(conn):
 def cmd_sync(conn, repair=False):
     """Check consistency between working memory cache DB and kernel nftables sets."""
     now = time.time()
-    db_ips = {row[0] for row in conn.execute("SELECT ip FROM bans WHERE unban_time > ?", (now,))}
+
+    # Query mappings of IP -> unban_time instead of just a set of IPs
+    cur = conn.execute("SELECT ip, unban_time FROM bans WHERE unban_time > ?", (now,))
+    db_bans = {row[0]: row[1] for row in cur.fetchall()}
+    db_ips = set(db_bans.keys())
+
     nft_v4 = get_ban_set_ips("ip")
     nft_v6 = get_ban_set_ips("ip6")
     all_nft = nft_v4 | nft_v6
@@ -228,13 +235,21 @@ def cmd_sync(conn, repair=False):
         if repair:
             print("Injecting missing rules into kernel routing tree...")
             for ip in sorted(missing_in_nft):
-                family = "ip6" if ":" in ip else "ip"
-                set_name = "pcap_banned_v6" if family == "ip6" else "pcap_banned_v4"
-                subprocess.run(
-                    ["nft", "add", "element", family, "filter", set_name, f"{{ {ip} }}"],
-                    capture_output=True, text=True
-                )
-                print(f"   ➕ Remounted {ip}")
+                family_type = "ip6" if ":" in ip else "ip"
+                set_name = "pcap_banned_v6" if family_type == "ip6" else "pcap_banned_v4"
+
+                # Calculate exact remaining duration
+                unban_time = db_bans[ip]
+                remaining = int(unban_time - time.time())
+
+                cmd = ["nft", "add", "element", "inet", "pcap_watch", set_name, "{", ip]
+                if unban_time != float("inf") and remaining > 0:
+                    cmd.extend(["timeout", f"{remaining}s"])
+                cmd.append("}")
+
+                subprocess.run(cmd, capture_output=True, text=True)
+                print(
+                    f"   ➕ Remounted {ip} (Remaining: {format_duration(remaining) if unban_time != float('inf') else 'permanent'})")
         else:
             print("   Execute with --repair to automatically fix.")
 

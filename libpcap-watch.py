@@ -123,6 +123,43 @@ def load_config(config_path: str) -> dict:
         return default_config
 
 
+def start_ping_listener(socket_path: str, stop_event: threading.Event):
+    """Starts a non-blocking background thread to reply to libpcap-manage ping requests."""
+    if os.path.exists(socket_path):
+        try:
+            os.unlink(socket_path)
+        except OSError:
+            pass
+
+    def listener():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)  # Allow timeout to check stop_event
+            s.bind(socket_path)
+            s.listen(5)
+            os.chmod(socket_path, 0o666)
+            while not stop_event.is_set():
+                try:
+                    conn, _ = s.accept()
+                    with conn:
+                        data = conn.recv(1024)
+                        if data == b"ping":
+                            conn.sendall(b"pong!")
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+        # Clean up socket file on thread exit
+        if os.path.exists(socket_path):
+            try:
+                os.unlink(socket_path)
+            except OSError:
+                pass
+
+    t = threading.Thread(target=listener, name="IPC-Listener", daemon=True)
+    t.start()
+    return t
+
+
 class NoopDecisionLogger:
     def log_ban(self, ip, rule_desc, duration, timestamp): pass
 
@@ -196,73 +233,57 @@ class DecisionLogger:
 
 
 class NftablesManager:
-    """Create and manage dedicated 'ban' chains and sets in nftables for IPv4 and IPv6."""
+    """
+    Manages an isolated, negative-priority 'inet' table in nftables.
+    Hooks at priority -10 (before UFW at priority 0) to guarantee instant packet drops.
+    """
 
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
 
     def init_ban_chain(self):
-        self._ensure_chain_and_set("ip")
-        self._ensure_chain_and_set("ip6")
-
-    def _ensure_chain_and_set(self, family: str):
+        """Atomically initialize the negative-priority inet table, sets, and drop chains."""
         if self.dry_run:
-            print(f"[SIMULATE] Setup nftables ban chain and sets for {family}")
+            print("[SIMULATE] Initializing zero-trust inet table 'pcap_watch' at priority -10")
             return
 
-        set_name = "pcap_banned_ipv4" if family == "ip" else "pcap_banned_ipv6"
-        addr_type = "ipv4_addr" if family == "ip" else "ipv6_addr"
+        # Atomic nftables ruleset definition
+        ruleset = """
+        add table inet pcap_watch
+        add set inet pcap_watch pcap_banned_v4 { type ipv4_addr; flags timeout; }
+        add set inet pcap_watch pcap_banned_v6 { type ipv6_addr; flags timeout; }
 
-        subprocess.run(["nft", "add", "table", family, "filter"], capture_output=True)
+        add chain inet pcap_watch input_guard { type filter hook input priority -10; policy accept; }
+        add chain inet pcap_watch forward_guard { type filter hook forward priority -10; policy accept; }
 
-        for chain, hook, prio in [("input", "input", "0"), ("forward", "forward", "0")]:
-            check = subprocess.run(["nft", "list", "chain", family, "filter", chain], capture_output=True)
-            if check.returncode != 0:
-                subprocess.run([
-                    "nft", "add", "chain", family, "filter", chain,
-                    "{", "type", "filter", "hook", hook, "priority", f"{prio};", "policy", "accept;", "}"
-                ], capture_output=True)
+        flush chain inet pcap_watch input_guard
+        flush chain inet pcap_watch forward_guard
 
-        subprocess.run([
-            "nft", "add", "set", family, "filter", set_name,
-            "{", "type", addr_type + ";", "flags", "timeout;", "}"
-        ], capture_output=True)
+        add rule inet pcap_watch input_guard ip saddr @pcap_banned_v4 counter drop
+        add rule inet pcap_watch input_guard ip6 saddr @pcap_banned_v6 counter drop
+        add rule inet pcap_watch forward_guard ip saddr @pcap_banned_v4 counter drop
+        add rule inet pcap_watch forward_guard ip6 saddr @pcap_banned_v6 counter drop
+        """
 
-        check_chain = subprocess.run(["nft", "list", "chain", family, "filter", "ban"], capture_output=True)
-        if check_chain.returncode != 0:
-            subprocess.run(["nft", "add", "chain", family, "filter", "ban"], capture_output=True)
-
-        subprocess.run(["nft", "flush", "chain", family, "filter", "ban"], capture_output=True)
-
-        addr_key = "ip saddr" if family == "ip" else "ip6 saddr"
-        subprocess.run([
-            "nft", "add", "rule", family, "filter", "ban",
-            addr_key, "@" + set_name, "counter", "drop"
-        ], capture_output=True)
-
-        for base_chain in ("input", "forward"):
-            chain_check = subprocess.run(["nft", "list", "chain", family, "filter", base_chain], capture_output=True,
-                                         text=True)
-            if "jump ban" not in chain_check.stdout:
-                insert = subprocess.run(
-                    ["nft", "insert", "rule", family, "filter", base_chain, "position", "1", "jump", "ban"],
-                    capture_output=True)
-                if insert.returncode != 0:
-                    subprocess.run(["nft", "add", "rule", family, "filter", base_chain, "jump", "ban"],
-                                   capture_output=True)
+        result = subprocess.run(["nft", "-f", "-"], input=ruleset, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[{timestamp()}] CRITICAL: Failed to initialize nftables: {result.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"[{timestamp()}] Nftables zero-trust inet table 'pcap_watch' initialized at priority -10.")
 
     def ban_ip(self, ip: str, duration: int = 0):
-        family = "ip6" if ":" in ip else "ip"
-        set_name = "pcap_banned_ipv6" if family == "ip6" else "pcap_banned_ipv4"
+        family_type = "ip6" if ":" in ip else "ip"
+        set_name = "pcap_banned_v6" if family_type == "ip6" else "pcap_banned_v4"
 
         if self.dry_run:
             timeout_str = f" timeout {duration}s" if duration > 0 else ""
-            print(f"[SIMULATE] nft add element {family} filter {set_name} {{ {ip}{timeout_str} }}")
+            print(f"[SIMULATE] nft add element inet pcap_watch {set_name} {{ {ip}{timeout_str} }}")
             return
 
         print(
-            f"[{timestamp()}] BANNING IP: {ip} -> nftables {family} set '{set_name}' for {duration if duration > 0 else 'permanent'}s")
-        cmd = ["nft", "add", "element", family, "filter", set_name, "{", ip]
+            f"[{timestamp()}] BANNING IP: {ip} -> inet pcap_watch set '{set_name}' for {duration if duration > 0 else 'permanent'}s")
+        cmd = ["nft", "add", "element", "inet", "pcap_watch", set_name, "{", ip]
         if duration > 0:
             cmd.extend(["timeout", f"{duration}s"])
         cmd.append("}")
@@ -272,15 +293,15 @@ class NftablesManager:
             print(f"[{timestamp()}] ERROR: nft ban failed: {result.stderr.strip()}", file=sys.stderr)
 
     def unban_ip(self, ip: str):
-        family = "ip6" if ":" in ip else "ip"
-        set_name = "pcap_banned_ipv6" if family == "ip6" else "pcap_banned_ipv4"
+        family_type = "ip6" if ":" in ip else "ip"
+        set_name = "pcap_banned_v6" if family_type == "ip6" else "pcap_banned_v4"
 
         if self.dry_run:
-            print(f"[SIMULATE] nft delete element {family} filter {set_name} {{ {ip} }}")
+            print(f"[SIMULATE] nft delete element inet pcap_watch {set_name} {{ {ip} }}")
             return
 
-        print(f"[{timestamp()}] UNBANNING IP: {ip} from nftables set '{set_name}'")
-        result = subprocess.run(["nft", "delete", "element", family, "filter", set_name, "{", ip, "}"],
+        print(f"[{timestamp()}] UNBANNING IP: {ip} from inet pcap_watch set '{set_name}'")
+        result = subprocess.run(["nft", "delete", "element", "inet", "pcap_watch", set_name, "{", ip, "}"],
                                 capture_output=True, text=True)
         if result.returncode != 0 and "does not exist" not in result.stderr and "No such file" not in result.stderr:
             print(f"[{timestamp()}] ERROR: nft unban failed: {result.stderr.strip()}", file=sys.stderr)
@@ -610,6 +631,10 @@ class NetWatch:
         # Start unban thread
         unban_thread = threading.Thread(target=self._unban_loop, daemon=True)
         unban_thread.start()
+
+        # Start IPC Ping Listener (NEW)
+        socket_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libpcap-watch.sock")
+        ipc_thread = start_ping_listener(socket_path, self._shutdown_event)
 
         # Start Scapy capture thread
         sniffer = PacketSniffer(self.capture_config, self.packet_queue, self._shutdown_event)
