@@ -18,9 +18,8 @@ import subprocess
 import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass
-
-# Scapy imports
 from scapy.all import sniff, IP, IPv6, TCP
+from collections import defaultdict, deque
 
 
 def timestamp() -> str:
@@ -96,13 +95,13 @@ def build_bpf_filter(config: CaptureConfig) -> str:
 
 
 def load_config(config_path: str) -> dict:
-    """Load configuration from a JSON file with safe fallbacks."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_config = {
         "poll_interval": 1,
         "unban_check_interval": 60,
-        "interfaces": [],       # Empty = auto-detect default
-        "destination_ips": [],  # Empty = auto-detect interface IP
+        "memory_prune_interval": 900,
+        "interfaces": [],
+        "destination_ips": [],
         "filter_all_destinations": False,
         "history_db_enable": True,
         "rules_file": os.path.join(script_dir, "rules.json"),
@@ -307,8 +306,61 @@ class NftablesManager:
             print(f"[{timestamp()}] ERROR: nft unban failed: {result.stderr.strip()}", file=sys.stderr)
 
 
+class InMemoryHitTracker:
+    """
+    High-performance in-memory packet hit tracking engine.
+    Uses lazy left-popping on deques to achieve O(1) appends and rapid expiration pruning.
+    """
+
+    def __init__(self):
+        # Key: (ip, rule_id) -> Value: deque of (timestamp, port) tuples
+        self.hits = defaultdict(deque)
+
+    def add_hit(self, ip: str, rule_id: int, port: int, ts: float):
+        """Append a packet hit timestamp and target port to the IP/Rule queue."""
+        self.hits[(ip, rule_id)].append((ts, port))
+
+    def _prune_queue(self, q: deque, cutoff: float):
+        """Helper method: lazily left-pop expired timestamps from a queue."""
+        while q and q[0][0] <= cutoff:
+            q.popleft()
+
+    def count_recent_hits(self, ip: str, rule_id: int, window: float) -> int:
+        """Prune expired hits and return the count of recent hits for rate-flood rules."""
+        key = (ip, rule_id)
+        if key not in self.hits:
+            return 0
+
+        q = self.hits[key]
+        self._prune_queue(q, time.time() - window)
+        return len(q)
+
+    def count_distinct_ports(self, ip: str, rule_id: int, window: float) -> int:
+        """Prune expired hits and return the count of unique ports for port-scan rules."""
+        key = (ip, rule_id)
+        if key not in self.hits:
+            return 0
+
+        q = self.hits[key]
+        self._prune_queue(q, time.time() - window)
+        return len(set(port for _, port in q))
+
+    def prune_expired(self, max_window: float):
+        """
+        Background maintenance task: prunes old timestamps across all tracked keys
+        and deletes empty dictionary keys to prevent memory leaks over long uptimes.
+        """
+        cutoff = time.time() - max_window
+        # Convert keys to a static list to safely mutate the dictionary during iteration
+        for key in list(self.hits.keys()):
+            q = self.hits[key]
+            self._prune_queue(q, cutoff)
+            if not q:
+                del self.hits[key]
+
+
 class Database:
-    """SQLite backend for tracking active bans and packet hit histories."""
+    """SQLite backend for tracking active bans. Hit tracking has been moved to memory."""
 
     def __init__(self, db_path: str, dry_run: bool = False):
         self.dry_run = dry_run
@@ -323,8 +375,8 @@ class Database:
         # Optimize SQLite to run almost entirely in RAM while retaining disk durability
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")  # Safe in WAL mode, massive I/O boost
-        self.conn.execute("PRAGMA temp_store=MEMORY")  # Keep temporary indices/tables in RAM
-        self.conn.execute("PRAGMA cache_size=-32000")  # Allocate ~32MB of RAM for database cache
+        self.conn.execute("PRAGMA temp_store=MEMORY")   # Keep temporary indices/tables in RAM
+        self.conn.execute("PRAGMA cache_size=-32000")   # Allocate ~32MB of RAM for database cache
 
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS bans (
@@ -333,51 +385,10 @@ class Database:
                 rule_desc TEXT
             )
         """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS rule_hits (
-                ip TEXT,
-                rule_id INTEGER,
-                port INTEGER,
-                timestamp REAL
-            )
-        """)
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_rule_hits_cleanup ON rule_hits (timestamp)")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_rule_hits_lookup ON rule_hits (ip, rule_id, timestamp)")
         self.conn.commit()
 
     def close(self):
         self.conn.close()
-
-    def cleanup_old_hits(self, window: float):
-        now = time.time()
-        self.conn.execute("DELETE FROM rule_hits WHERE timestamp < ?", (now - window,))
-        self.conn.commit()
-
-    def add_hit(self, ip: str, rule_id: int, port: int, ts: float = None):
-        hit_time = ts if ts is not None else time.time()
-        self.conn.execute(
-            "INSERT INTO rule_hits (ip, rule_id, port, timestamp) VALUES (?, ?, ?, ?)",
-            (ip, rule_id, port, hit_time),
-        )
-        self.conn.commit()
-
-    def count_recent_hits(self, ip: str, rule_id: int, window: float) -> int:
-        """Count total hits matching a rule (used for port rate floods / brute force)."""
-        now = time.time()
-        cur = self.conn.execute(
-            "SELECT COUNT(*) FROM rule_hits WHERE ip = ? AND rule_id = ? AND timestamp > ?",
-            (ip, rule_id, now - window),
-        )
-        return cur.fetchone()[0]
-
-    def count_distinct_ports(self, ip: str, rule_id: int, window: float) -> int:
-        """Count distinct ports accessed by an IP (used for horizontal port scan detection)."""
-        now = time.time()
-        cur = self.conn.execute(
-            "SELECT COUNT(DISTINCT port) FROM rule_hits WHERE ip = ? AND rule_id = ? AND timestamp > ?",
-            (ip, rule_id, now - window),
-        )
-        return cur.fetchone()[0]
 
     def get_ban(self, ip: str):
         cur = self.conn.execute("SELECT unban_time, rule_desc FROM bans WHERE ip = ?", (ip,))
@@ -531,6 +542,7 @@ class NetWatch:
         config = load_config(args.config)
         self.poll_interval = config.get("poll_interval", 1)
         self.unban_check_interval = config.get("unban_check_interval", 60)
+        self.memory_prune_interval = config.get("memory_prune_interval", 900)
 
         # Setup Capture Interfaces
         if args.interface:
@@ -564,6 +576,7 @@ class NetWatch:
         self.nft = NftablesManager(dry_run=self.dry_run)
         self.db_path = config["db_path"]
         self.db = Database(self.db_path, dry_run=self.dry_run)
+        self.hit_tracker = InMemoryHitTracker()
 
         self.rules_engine = NetworkRuleEngine(config["rules_file"])
 
@@ -578,13 +591,13 @@ class NetWatch:
 
     def _handle_matches(self, ip: str, dport: int, matched: list[tuple[int, dict]], event_time: float):
         for rule_idx, rule in matched:
-            self.db.add_hit(ip, rule_idx, dport, event_time)
+            self.hit_tracker.add_hit(ip, rule_idx, dport, event_time)
 
             rtype = rule.get("type")
             if rtype == "port_scan":
-                count = self.db.count_distinct_ports(ip, rule_idx, rule["window"])
+                count = self.hit_tracker.count_distinct_ports(ip, rule_idx, rule["window"])
             else:
-                count = self.db.count_recent_hits(ip, rule_idx, rule["window"])
+                count = self.hit_tracker.count_recent_hits(ip, rule_idx, rule["window"])
 
             if count >= rule["threshold"]:
                 existing = self.db.get_ban(ip)
@@ -670,9 +683,9 @@ class NetWatch:
                 except Exception as e:
                     print(f"[{timestamp()}] ERROR in packet processing loop: {e}", file=sys.stderr)
 
-                # Periodically clean up old hit histories to prevent SQLite bloat
-                if time.time() - last_cleanup > 60:
-                    self.db.cleanup_old_hits(max_window)
+                # Periodically prune expired hit histories from memory to prevent RAM bloat
+                if time.time() - last_cleanup > self.memory_prune_interval:
+                    self.hit_tracker.prune_expired(max_window)
                     last_cleanup = time.time()
 
         finally:

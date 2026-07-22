@@ -7,23 +7,24 @@ A real-time Network Intrusion Prevention System (IPS) for Linux. libpcap-watch c
 ## Key Features
 
 * **Zero-Overhead BPF Filtering:** Constructs precise Berkeley Packet Filters (BPF) so the kernel only passes half-open SYNs and illegal TCP flag combinations (NULL, FIN, XMAS) to user space. Clean, established traffic is never processed by Python.
-* **Dynamic Kernel Netfilter Engine:** Automatically builds and manages dedicated nftables tables, chains, and sets (pcap_banned_ipv4 and pcap_banned_ipv6) with native hardware timeout flags.
+* **Dynamic Kernel Netfilter Engine:** Automatically builds and manages dedicated nftables tables, chains, and sets (`pcap_banned_ipv4` and `pcap_banned_ipv6`) with native hardware timeout flags.
 * **Multi-Vector Threat Detection:**
     * **Stealth & Evasion Scans:** Instant detection of Nmap NULL, FIN, XMAS, and SYN-FIN anomalies.
     * **Horizontal Port Scans:** Catches aggressive and slow sweeps across distinct ports.
     * **Brute-Force & Floods:** Mitigates SSH brute-force attempts and Web SYN floods.
     * **Honeypot Traps:** Instant permanent or long-term bans for touching legacy, admin, or IoT ports (Telnet, SMB, RDP, VNC, ADB, Mirai vectors).
-* **High-Performance In-Memory SQLite:** Utilizes WAL (Write-Ahead Logging) mode and memory caching (PRAGMA temp_store=MEMORY) for zero-latency hit tracking and history logging.
-* **Dedicated Management CLI:** Includes libpcap-manage.py for live auditing, kernel-to-database synchronization, telemetry extraction, and unbanning.
+* **Pure In-Memory Hit Tracking:** Utilizes a high-performance Python engine (`collections.defaultdict` and `deque`) with lazy left-popping for O(1) packet hit evaluation and port-scan tracking, scaling throughput to millions of packets per second without disk I/O bottlenecks.
+* **Persistent SQLite & Audit Logging:** Active network bans and historical audit telemetry are safely committed to an optimized SQLite database (WAL mode) to ensure firewall states survive server reboots.
+* **Dedicated Management CLI:** Includes `libpcap-manage.py` for live auditing, kernel-to-database synchronization, telemetry extraction, process health pings, and unbanning.
 
 ---
 
 ## Architecture & Workflow
 
 ```text
-[ Ingress Traffic ]
-        │
-        ▼
+            [ Ingress Traffic ]
+                     │
+                     ▼
 ┌──────────────────────────────────────────┐
 │ Kernel BPF Filter (Raw Socket Layer)     │
 │ Only passes SYN or Flag Anomaly packets  │
@@ -39,10 +40,10 @@ A real-time Network Intrusion Prevention System (IPS) for Linux. libpcap-watch c
                      │
          ┌───────────┴───────────┐
          ▼ (Yes)                 ▼ (No)
-┌──────────────────────┐  ┌──────────────┐
-│ Add to nftables Set  │  │ Log Hit To   │
-│ & SQLite Cache DB    │  │ Memory Cache │
-└──────────────────────┘  └──────────────┘
+┌──────────────────────┐  ┌──────────────────────┐
+│ Add to nftables Set  │  │ Append Hit to Pure   │
+│ & SQLite Ban DB      │  │ In-Memory RAM Engine │
+└──────────────────────┘  └──────────────────────┘
 ```
 
 ---
@@ -127,11 +128,33 @@ sudo journalctl -u libpcap-watch -f
 
 ---
 
-## Configuration (rules.json)
+## Configuration
 
-The engine is driven by rules.json. You can modify detection thresholds, time windows, and ban durations without touching the core code.
+The suite is configured via two primary JSON files: `libpcap-config.json` for core engine and memory parameters, and `rules.json` for dynamic intrusion detection rules.
 
-### Example Rule Structure
+### System Settings (`libpcap-config.json`)
+Core operational timers and capture interfaces can be modified without altering the Python script:
+
+```json
+{
+  "poll_interval": 1,
+  "unban_check_interval": 60,
+  "memory_prune_interval": 900,
+  "interfaces": [],
+  "destination_ips": [],
+  "filter_all_destinations": false,
+  "history_db_enable": true
+}
+```
+
+* `memory_prune_interval`: Background garbage collection interval (in seconds) that sweeps RAM and deletes idle IP hit queues to prevent memory creep over extended uptimes.
+* `unban_check_interval`: Frequency (in seconds) at which the engine queries SQLite to expire old bans and evicts them from kernel netfilter sets.
+* `poll_interval`: Internal timeout loop speed for queue event processing.
+
+### Detection Rules (`rules.json`)
+You can modify detection thresholds, time windows, and ban durations on the fly.
+
+#### Example Rule Structure
 ```json
 [
   {
@@ -167,7 +190,7 @@ The engine is driven by rules.json. You can modify detection thresholds, time wi
 ]
 ```
 
-### Rule Types
+#### Rule Types
 * `stealth_anomaly`: Triggers on TCP flag manipulations (e.g., zero flags set, FIN only, XMAS tree).
 * `port_scan`: Tracks unique destination ports accessed by a single IP within the defined time window.
 * `port_rate`: Tracks the total volume of connection attempts to specific target ports (useful for brute-force mitigation).
