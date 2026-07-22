@@ -499,7 +499,10 @@ class PacketSniffer(threading.Thread):
             # or illegal stealth scan flag combinations, we can classify instantly:
             # In Scapy, integer flag value 0x02 (2) represents a pure SYN packet.
             # Anything else that passed the kernel is by definition a stealth anomaly!
-            scan_type = "syn_scan" if int(tcp_layer.flags) == 0x02 else "stealth_anomaly"
+
+            # Apply bitwise mask (~0xC0) to filter out TCP ECN flags (0x40 ECE, 0x80 CWR)
+            clean_flags = int(tcp_layer.flags) & ~0xC0
+            scan_type = "syn_scan" if clean_flags == 0x02 else "stealth_anomaly"
 
             # Push non-blocking tuple: (source_ip, destination_port, scan_type, timestamp)
             self.packet_queue.put((src_ip, dport, scan_type, time.time()))
