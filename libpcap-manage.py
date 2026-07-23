@@ -20,6 +20,7 @@ import subprocess
 import time
 import argparse
 from datetime import datetime, timezone
+import json
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, "libpcap-watch.db")
@@ -50,28 +51,27 @@ def format_duration(seconds):
 
 def get_ban_set_ips(family):
     """Return set of IP addresses currently in the unified inet pcap_watch sets."""
-    # Map 'ip' -> 'pcap_banned_v4', 'ip6' -> 'pcap_banned_v6'
     set_name = "pcap_banned_v4" if family == "ip" else "pcap_banned_v6"
     try:
-        # Target the unified 'inet' family and 'pcap_watch' table
         output = subprocess.run(
-            ["nft", "list", "set", "inet", "pcap_watch", set_name],
+            ["nft", "-j", "list", "set", "inet", "pcap_watch", set_name],
             capture_output=True, text=True, check=True
         ).stdout
-    except subprocess.CalledProcessError:
+        data = json.loads(output)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         return set()
 
     ips = set()
-    match = re.search(r'elements\s*=\s*\{([^}]+)\}', output)
-    if not match:
-        return ips
-
-    for item in match.group(1).split(","):
-        tokens = item.strip().split()
-        if tokens:
-            ip = tokens[0]
-            if "." in ip or ":" in ip:
-                ips.add(ip)
+    for block in data.get("nftables", []):
+        if "element" in block and block["element"].get("name") == set_name:
+            for element_item in block["element"].get("elem", []):
+                # Elements can be just a string (if no timeout/counter) or a dict wrapping "elem"
+                if isinstance(element_item, dict) and "elem" in element_item:
+                    val = element_item["elem"].get("val")
+                    if val:
+                        ips.add(val)
+                elif isinstance(element_item, str):
+                    ips.add(element_item)
     return ips
 
 
@@ -81,26 +81,25 @@ def get_ban_set_counters(family):
     set_name = "pcap_banned_v4" if family == "ip" else "pcap_banned_v6"
     try:
         output = subprocess.run(
-            ["nft", "list", "set", "inet", "pcap_watch", set_name],
+            ["nft", "-j", "list", "set", "inet", "pcap_watch", set_name],
             capture_output=True, text=True, check=True
         ).stdout
-    except subprocess.CalledProcessError:
+        data = json.loads(output)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         return counters
 
-    match = re.search(r'elements\s*=\s*\{([^}]+)\}', output)
-    if not match:
-        return counters
-
-    for item in match.group(1).split(","):
-        tokens = item.strip().split()
-        if tokens:
-            ip = tokens[0]
-            if "." in ip or ":" in ip:
-                pkt_match = re.search(r'packets\s+(\d+)', item)
-                bytes_match = re.search(r'bytes\s+(\d+)', item)
-                packets = int(pkt_match.group(1)) if pkt_match else 0
-                byt = int(bytes_match.group(1)) if bytes_match else 0
-                counters[ip] = (packets, byt)
+    for block in data.get("nftables", []):
+        if "element" in block and block["element"].get("name") == set_name:
+            for element_item in block["element"].get("elem", []):
+                if isinstance(element_item, dict) and "elem" in element_item:
+                    elem_data = element_item["elem"]
+                    val = elem_data.get("val")
+                    if val:
+                        # Extract hardware counters if the set tracks them
+                        counter_data = elem_data.get("counter", {})
+                        packets = counter_data.get("packets", 0)
+                        bytes_val = counter_data.get("bytes", 0)
+                        counters[val] = (packets, bytes_val)
     return counters
 
 
