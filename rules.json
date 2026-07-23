@@ -37,7 +37,7 @@
     "description": "Web SYN Flood or Aggressive Crawler/Scanner (>200 connections in 10s)"
   },
   {
-    "type": "port_rate",
+    "type": "honeypot_port",
     "ports": [3306, 5432, 1433, 6379, 27017],
     "threshold": 1,
     "window": 60,
@@ -99,5 +99,29 @@
     "window": 30,
     "ban_duration": 86400,
     "description": "VPN / Edge Gateway Aggressive Scanning (>20 attempts in 30s)"
+  },
+  {
+    "type": "honeypot_port",
+    "ports": [7001, 7002, 8161, 10000],
+    "threshold": 1,
+    "window": 60,
+    "ban_duration": 7776000,
+    "description": "Honeypot Trap: Enterprise Middleware Exploits (WebLogic, ActiveMQ, Webmin)"
+  },
+  {
+    "type": "honeypot_port",
+    "ports": [111, 389, 636, 873, 2049],
+    "threshold": 1,
+    "window": 60,
+    "ban_duration": 7776000,
+    "description": "Honeypot Trap: File Sharing & Directory Services (RPC, NFS, Rsync, LDAP)"
+  },
+  {
+    "type": "honeypot_port",
+    "ports": [4444, 4445, 6666, 7777, 9999],
+    "threshold": 1,
+    "window": 60,
+    "ban_duration": 7776000,
+    "description": "Honeypot Trap: Malware C2 Handlers & Backdoor Frameworks"
   }
 ]
