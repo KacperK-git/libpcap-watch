@@ -67,7 +67,8 @@ def get_interface_ip(interface: str) -> str:
 def build_bpf_filter(config: CaptureConfig) -> str:
     """
     Construct a kernel-level BPF filter using exact integer constants
-    to ensure 100% compatibility across all libpcap versions.
+    to ensure 100% compatibility across all libpcap versions, explicitly
+    supporting both IPv4 and IPv6 protocol families.
     """
     # 1. Standard Half-Open SYN (SYN set, ACK not set)
     syn_scan = "tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn"
@@ -84,8 +85,11 @@ def build_bpf_filter(config: CaptureConfig) -> str:
     # 5. SYN-FIN Anomaly -> SYN (2) + FIN (1) = 3. Both must be set.
     syn_fin = "tcp[tcpflags] & 3 == 3"
 
-    # Combine all attack vectors into a single kernel evaluation tree
-    attack_vectors = f"({syn_scan}) or ({null_scan}) or ({fin_scan}) or ({xmas_scan}) or ({syn_fin})"
+    # Combine all attack vectors into a single logic block
+    tcp_logic = f"({syn_scan}) or ({null_scan}) or ({fin_scan}) or ({xmas_scan}) or ({syn_fin})"
+
+    # Wrap with explicit IPv4 and IPv6 protocol qualifiers to ensure full compatibility
+    attack_vectors = f"(ip and ({tcp_logic})) or (ip6 and ({tcp_logic}))"
 
     if config.filter_all_destinations or not config.destination_ips:
         return attack_vectors
