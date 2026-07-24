@@ -12,7 +12,6 @@ Commands:
 """
 
 import os
-import re
 import sys
 import socket
 import sqlite3
