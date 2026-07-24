@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from scapy.all import sniff, IP, IPv6, TCP
 from collections import defaultdict, deque
+import ipaddress
 
 
 def timestamp() -> str:
@@ -108,6 +109,14 @@ def load_config(config_path: str) -> dict:
         "destination_ips": [],
         "filter_all_destinations": False,
         "history_db_enable": True,
+        "whitelist_ips": [
+            "127.0.0.0/8",    # Localhost IPv4
+            "::1/128",        # Localhost IPv6
+            "10.0.0.0/8",     # Private Class A
+            "172.16.0.0/12",  # Private Class B
+            "192.168.0.0/16", # Private Class C
+            "fe80::/10"       # Link-local IPv6
+        ],
         "rules_file": os.path.join(script_dir, "rules.json"),
         "db_path": os.path.join(script_dir, "libpcap-watch.db"),
         "history_db_path": os.path.join(script_dir, "libpcap-watch-history.db"),
@@ -548,6 +557,15 @@ class NetWatch:
         self.unban_check_interval = config.get("unban_check_interval", 60)
         self.memory_prune_interval = config.get("memory_prune_interval", 900)
 
+        # Parse whitelist networks
+        self.whitelist_networks = []
+        for net_str in config.get("whitelist_ips", []):
+            try:
+                # strict=False allows parsing "192.168.1.5/24" seamlessly into "192.168.1.0/24"
+                self.whitelist_networks.append(ipaddress.ip_network(net_str, strict=False))
+            except ValueError as e:
+                print(f"[{timestamp()}] WARNING: Invalid whitelist IP/subnet '{net_str}': {e}", file=sys.stderr)
+
         # Setup Capture Interfaces
         if args.interface:
             interfaces = args.interface
@@ -593,7 +611,22 @@ class NetWatch:
         if not self.silent or force:
             print(f"[{timestamp()}] {msg}")
 
+    def _is_whitelisted(self, ip_str: str) -> bool:
+        """Evaluate if an IP exists inside any of the configured whitelist subnets."""
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+            for network in self.whitelist_networks:
+                if ip_obj in network:
+                    return True
+        except ValueError:
+            pass
+        return False
+
     def _handle_matches(self, ip: str, dport: int, matched: list[tuple[int, dict]], event_time: float):
+        # Abort immediately if the IP matches a trusted subnet
+        if self._is_whitelisted(ip):
+            return
+
         for rule_idx, rule in matched:
             self.hit_tracker.add_hit(ip, rule_idx, dport, event_time)
 
